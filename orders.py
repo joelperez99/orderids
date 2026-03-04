@@ -1,5 +1,3 @@
-import json
-import os
 import re
 import subprocess
 import sys
@@ -14,63 +12,40 @@ import streamlit as st
 # CONFIG
 # =========================
 ML_URL = "https://www.mercadolibre.com.mx/ventas/omni/listado"
-PROFILE_DIR = Path(".ml_profile")
-PROFILE_DIR.mkdir(exist_ok=True)
-SESSION_FILE = Path("ml_session.json")
+
+# Ruta al perfil de Chrome donde ya tienes sesión de ML iniciada.
+# Ajusta según tu sistema operativo:
+#   Windows : Path.home() / "AppData/Local/Google/Chrome/User Data"
+#   macOS   : Path.home() / "Library/Application Support/Google/Chrome"
+#   Linux   : Path.home() / ".config/google-chrome"
+CHROME_PROFILE = Path.home() / ".config" / "google-chrome"
+CHROME_PROFILE_NAME = "Default"   # cambia si usas "Profile 1", etc.
 
 # =========================
-# UI BOOT
+# UI
 # =========================
 st.set_page_config(page_title="ML Orders → Excel", layout="wide")
-st.title("Mercado Libre: Order IDs → cargos → Excel")
+st.title("Mercado Libre: Order IDs → Excel")
 
 
 # =========================
-# INSTALAR BROWSERS UNA SOLA VEZ
+# INSTALAR CHROMIUM UNA SOLA VEZ
 # =========================
-@st.cache_resource(show_spinner="Instalando navegador Chromium (solo la primera vez)...")
-def install_playwright_browsers():
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if result.returncode != 0:
-            return False, result.stderr
-        return True, "OK"
-    except Exception as e:
-        return False, str(e)
+@st.cache_resource(show_spinner="Preparando navegador...")
+def install_playwright():
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True, text=True, timeout=180,
+    )
+    if result.returncode != 0:
+        return False, result.stderr
+    return True, "OK"
 
 
-ok, msg = install_playwright_browsers()
+ok, msg = install_playwright()
 if not ok:
     st.error(f"No se pudo instalar Chromium:\n{msg}")
     st.stop()
-
-
-# =========================
-# DETECTAR ENTORNO
-# =========================
-def is_cloud_env() -> bool:
-    return (
-        os.getenv("STREAMLIT_SERVER_HEADLESS") == "true"
-        or os.getenv("HOSTNAME", "").startswith("streamlit")
-        or os.getenv("HOME", "").startswith("/home/adminuser")
-    )
-
-
-CLOUD = is_cloud_env()
-
-if CLOUD:
-    st.info(
-        "☁️ **Entorno Cloud detectado.** El navegador corre en modo headless (sin ventana visible).  \n"
-        "Para hacer login con 2FA: corre la app **localmente**, haz login, exporta la sesión "
-        "con el botón de abajo y sube el archivo `ml_session.json` a tu repositorio."
-    )
-else:
-    st.success("💻 Entorno **local** detectado. El navegador se abrirá de forma visible para que hagas login.")
 
 
 # =========================
@@ -79,9 +54,7 @@ else:
 def parse_mxn(value: str) -> float | None:
     if value is None:
         return None
-    s = value.strip().replace("MXN", "").replace("$", "").replace(" ", "")
-    s = s.replace(",", "")
-    s = re.sub(r"[^0-9\.\-]", "", s)
+    s = re.sub(r"[^0-9.\-]", "", value.replace(",", ""))
     if s in ("", "-", ".", "-."):
         return None
     try:
@@ -91,9 +64,7 @@ def parse_mxn(value: str) -> float | None:
 
 
 def clean_order_ids(raw: str) -> list[str]:
-    if not raw:
-        return []
-    ids = re.findall(r"\d{8,}", raw)
+    ids = re.findall(r"\d{8,}", raw or "")
     seen, out = set(), []
     for x in ids:
         if x not in seen:
@@ -117,97 +88,73 @@ def label_value(page, label_text: str, timeout_ms: int = 8000) -> str | None:
         return None
 
 
-def build_launch_kwargs() -> dict:
-    """Parámetros de lanzamiento según entorno."""
-    kwargs = dict(
-        user_data_dir=str(PROFILE_DIR),
-        headless=CLOUD,
-        viewport={"width": 1400, "height": 900},
-        timeout=60000,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
-    )
-    # Si existe archivo de sesión exportado, úsalo
-    if SESSION_FILE.exists():
-        kwargs["storage_state"] = str(SESSION_FILE)
-    return kwargs
+def _empty_row(oid: str, error: str) -> dict:
+    return {
+        "Order ID": oid, "Monto": None, "Comisión por venta": None,
+        "Cargo por envío": None, "ISR 2.5%": None, "Error": error,
+    }
 
 
 # =========================
-# PLAYWRIGHT: LOGIN
+# FETCH ORDERS — usa perfil existente, sin login
 # =========================
-def open_browser_and_login():
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as p:
-        kwargs = build_launch_kwargs()
-        ctx = p.chromium.launch_persistent_context(**kwargs)
-        page = ctx.new_page()
-        page.goto(ML_URL, wait_until="domcontentloaded")
-
-        if not CLOUD:
-            # Espera hasta 3 minutos para que el usuario haga login manual
-            st.info("🌐 Navegador abierto. Haz login y completa el 2FA. Tienes 3 minutos.")
-            page.wait_for_timeout(180_000)
-
-        # Exportar sesión al terminar (útil para subir a Cloud después)
-        storage = ctx.storage_state()
-        with open(SESSION_FILE, "w") as f:
-            json.dump(storage, f)
-
-        ctx.close()
-
-    return storage
-
-
-# =========================
-# PLAYWRIGHT: FETCH ORDERS
-# =========================
-def fetch_orders(order_ids: list[str]) -> pd.DataFrame:
+def fetch_orders(order_ids: list[str], profile_path: Path, profile_name: str) -> pd.DataFrame:
     from playwright.sync_api import sync_playwright
 
     rows = []
     with sync_playwright() as p:
-        kwargs = build_launch_kwargs()
-        ctx = p.chromium.launch_persistent_context(**kwargs)
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=str(profile_path),
+            channel="chrome",                        # usa el Chrome instalado en el sistema
+            headless=True,                           # sin ventana, no interfiere con Chrome abierto
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                f"--profile-directory={profile_name}",
+            ],
+            viewport={"width": 1400, "height": 900},
+            timeout=60_000,
+        )
+
         page = ctx.new_page()
         page.goto(ML_URL, wait_until="domcontentloaded")
 
-        # Localizar buscador
-        search = None
-        for attempt in range(2):
-            try:
-                search = page.get_by_placeholder(re.compile("Buscar", re.I)).first
-                search.wait_for(timeout=20000)
-                break
-            except Exception:
-                try:
-                    search = page.locator("input[type='text']").first
-                    search.wait_for(timeout=20000)
-                    break
-                except Exception:
-                    if attempt == 1:
-                        raise RuntimeError(
-                            "No se encontró el buscador. Probablemente la sesión expiró. "
-                            "Vuelve a hacer login."
-                        )
+        # Verificar sesión activa
+        if "login" in page.url.lower() or "identificate" in page.url.lower():
+            ctx.close()
+            raise RuntimeError(
+                "La sesión expiró. Abre Chrome, entra a ML manualmente y vuelve a intentarlo."
+            )
 
-        for oid in order_ids:
+        # Localizar buscador
+        try:
+            search = page.get_by_placeholder(re.compile("Buscar", re.I)).first
+            search.wait_for(timeout=20_000)
+        except Exception:
+            search = page.locator("input[type='text']").first
+            search.wait_for(timeout=20_000)
+
+        total = len(order_ids)
+        progress_bar = st.progress(0, text="Iniciando...")
+
+        for i, oid in enumerate(order_ids, 1):
+            progress_bar.progress(i / total, text=f"Procesando {i}/{total}:  {oid}")
+
             try:
-                # Buscar Order ID
                 search.click()
                 search.press("Control+A")
                 search.type(oid, delay=25)
-                time.sleep(0.9)
+                time.sleep(0.8)
 
                 # Abrir detalle
                 opened = False
-                for selector in [
+                for fn in [
                     lambda: page.get_by_role("button", name=re.compile("Ver detalle", re.I)).first,
                     lambda: page.get_by_text(re.compile("Ver detalle", re.I)).first,
                 ]:
                     try:
-                        el = selector()
-                        el.wait_for(timeout=12000)
+                        el = fn()
+                        el.wait_for(timeout=12_000)
                         el.click()
                         opened = True
                         break
@@ -215,83 +162,63 @@ def fetch_orders(order_ids: list[str]) -> pd.DataFrame:
                         continue
 
                 if not opened:
-                    rows.append(_empty_row(oid, "No se encontró botón 'Ver detalle'"))
+                    rows.append(_empty_row(oid, "No se encontró 'Ver detalle'"))
                     continue
 
-                # Esperar panel de detalle
                 try:
-                    page.locator("text=Precio del producto").first.wait_for(timeout=20000)
+                    page.locator("text=Precio del producto").first.wait_for(timeout=20_000)
                 except Exception:
                     pass
 
-                monto     = parse_mxn(label_value(page, "Precio del producto"))
-                comision  = parse_mxn(label_value(page, "Cargos por venta"))
-                envio     = parse_mxn(label_value(page, "Envíos"))
-                isr       = parse_mxn(label_value(page, "Impuestos"))
-
                 rows.append({
-                    "Order ID": oid,
-                    "Monto": monto,
-                    "Comisión por venta": comision,
-                    "Cargo por envío": envio,
-                    "ISR 2.5%": isr,
-                    "Error": None,
+                    "Order ID":           oid,
+                    "Monto":              parse_mxn(label_value(page, "Precio del producto")),
+                    "Comisión por venta": parse_mxn(label_value(page, "Cargos por venta")),
+                    "Cargo por envío":    parse_mxn(label_value(page, "Envíos")),
+                    "ISR 2.5%":           parse_mxn(label_value(page, "Impuestos")),
+                    "Error":              None,
                 })
 
             except Exception as e:
                 rows.append(_empty_row(oid, str(e)))
 
-            # Volver a la lista
+            # Regresar a la lista
             try:
                 page.go_back(wait_until="domcontentloaded")
             except Exception:
                 page.goto(ML_URL, wait_until="domcontentloaded")
 
-            # Re-localizar buscador
+            # Re-localizar buscador tras volver
             try:
-                search.wait_for(timeout=20000)
+                search.wait_for(timeout=15_000)
             except Exception:
                 try:
                     search = page.get_by_placeholder(re.compile("Buscar", re.I)).first
-                    search.wait_for(timeout=15000)
+                    search.wait_for(timeout=15_000)
                 except Exception:
                     search = page.locator("input[type='text']").first
 
         ctx.close()
+        progress_bar.progress(1.0, text="¡Listo!")
 
     df = pd.DataFrame(rows)
     return df[["Order ID", "Monto", "Comisión por venta", "Cargo por envío", "ISR 2.5%", "Error"]]
 
 
-def _empty_row(oid: str, error: str) -> dict:
-    return {
-        "Order ID": oid,
-        "Monto": None,
-        "Comisión por venta": None,
-        "Cargo por envío": None,
-        "ISR 2.5%": None,
-        "Error": error,
-    }
-
-
 # =========================
-# EXCEL EXPORT
+# EXCEL
 # =========================
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Ordenes")
         ws = writer.sheets["Ordenes"]
-
         for col in ws.columns:
             max_len = max((len(str(c.value or "")) for c in col), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 30)
-
-        # Formato moneda columnas B-E (Monto, Comisión, Envío, ISR)
         for row in ws.iter_rows(min_row=2, min_col=2, max_col=5):
             for cell in row:
                 cell.number_format = '"$"#,##0.00;-"$"#,##0.00'
-
     return output.getvalue()
 
 
@@ -299,8 +226,7 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
 # UI
 # =========================
 st.markdown("""
-**Columnas del Excel generado:**
-| Columna | Fuente en ML |
+| Columna Excel | Fuente en Mercado Libre |
 |---|---|
 | Monto | Precio del producto |
 | Comisión por venta | Cargos por venta |
@@ -310,46 +236,34 @@ st.markdown("""
 
 st.divider()
 
-# --- PASO 1: LOGIN ---
-st.subheader("Paso 1 · Sesión de Mercado Libre")
+# Configuración del perfil
+with st.expander("⚙️ Configuración de perfil de Chrome", expanded=False):
+    profile_path_str = st.text_input(
+        "Ruta al directorio de perfiles de Chrome:",
+        value=str(CHROME_PROFILE),
+        help=(
+            "Windows: C:/Users/USUARIO/AppData/Local/Google/Chrome/User Data  |  "
+            "macOS: /Users/USUARIO/Library/Application Support/Google/Chrome  |  "
+            "Linux: /home/USUARIO/.config/google-chrome"
+        ),
+    )
+    profile_name_str = st.text_input(
+        "Nombre del perfil:",
+        value=CHROME_PROFILE_NAME,
+        help="Normalmente 'Default'. Si usas múltiples perfiles puede ser 'Profile 1', etc.",
+    )
 
-col1, col2 = st.columns(2)
+profile_path = Path(profile_path_str)
 
-with col1:
-    session_exists = SESSION_FILE.exists()
-    status_label = "✅ Sesión guardada (`ml_session.json` encontrado)" if session_exists else "⚠️ Sin sesión guardada"
-    st.caption(status_label)
+if not profile_path.exists():
+    st.warning(
+        f"⚠️ Directorio no encontrado: `{profile_path}`  \n"
+        "Edita la ruta en ⚙️ **Configuración de perfil de Chrome** arriba."
+    )
 
-    if st.button("Abrir navegador y hacer login", use_container_width=True, disabled=CLOUD):
-        with st.spinner("Abriendo navegador..."):
-            try:
-                storage = open_browser_and_login()
-                st.success("Login completado y sesión guardada en `ml_session.json`.")
-                st.download_button(
-                    "⬇️ Descargar ml_session.json (para subir a Cloud)",
-                    data=json.dumps(storage, indent=2),
-                    file_name="ml_session.json",
-                    mime="application/json",
-                )
-            except Exception as e:
-                st.error("Falló al abrir navegador.")
-                st.exception(e)
-
-with col2:
-    st.caption("Sube aquí tu `ml_session.json` si lo tienes de una sesión local previa:")
-    uploaded = st.file_uploader("Subir ml_session.json", type="json", label_visibility="collapsed")
-    if uploaded:
-        SESSION_FILE.write_bytes(uploaded.read())
-        st.success("Sesión cargada correctamente.")
-        st.rerun()
-
-st.divider()
-
-# --- PASO 2: ORDER IDs ---
-st.subheader("Paso 2 · Ingresar Order IDs")
-
+st.subheader("Order IDs")
 raw_ids = st.text_area(
-    "Pega los Order IDs (uno por línea, o separados por comas/espacios):",
+    "Pega los Order IDs (uno por línea o separados por comas):",
     height=160,
     placeholder="2000011446863697\n2000014245438812\n...",
 )
@@ -358,37 +272,26 @@ st.caption(f"Order IDs detectados: **{len(order_ids)}**")
 
 st.divider()
 
-# --- PASO 3: CAPTURAR ---
-st.subheader("Paso 3 · Capturar y exportar")
-
-if not SESSION_FILE.exists() and CLOUD:
-    st.warning("⚠️ En Cloud necesitas subir un `ml_session.json` válido antes de capturar.")
-
 if st.button(
-    "▶️ Capturar información y generar Excel",
+    "▶️ Capturar y generar Excel",
     type="primary",
-    disabled=(len(order_ids) == 0),
+    disabled=(len(order_ids) == 0 or not profile_path.exists()),
     use_container_width=True,
 ):
     try:
-        progress = st.progress(0, text="Iniciando...")
-        status_box = st.empty()
+        df = fetch_orders(order_ids, profile_path, profile_name_str)
 
-        with st.spinner(f"Capturando {len(order_ids)} órdenes..."):
-            df = fetch_orders(order_ids)
-
-        progress.progress(100, text="¡Listo!")
         st.success(f"✅ {len(df)} órdenes procesadas.")
 
-        # Mostrar errores si hubo
         errores = df[df["Error"].notna()]
         if not errores.empty:
             st.warning(f"⚠️ {len(errores)} órdenes con error:")
             st.dataframe(errores[["Order ID", "Error"]], use_container_width=True)
 
-        st.dataframe(df.drop(columns=["Error"]), use_container_width=True)
+        df_show = df.drop(columns=["Error"])
+        st.dataframe(df_show, use_container_width=True)
 
-        xlsx = df_to_excel_bytes(df.drop(columns=["Error"]))
+        xlsx = df_to_excel_bytes(df_show)
         st.download_button(
             "⬇️ Descargar Excel",
             data=xlsx,
@@ -397,6 +300,8 @@ if st.button(
             use_container_width=True,
         )
 
+    except RuntimeError as e:
+        st.error(str(e))
     except Exception as e:
-        st.error("Falló la captura con Playwright.")
+        st.error("Falló la captura.")
         st.exception(e)
